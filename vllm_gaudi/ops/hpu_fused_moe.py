@@ -5,6 +5,7 @@ import torch
 import vllm
 from vllm.model_executor.layers.batch_invariant import vllm_is_batch_invariant
 from vllm.model_executor.layers.fused_moe.fused_moe import GroupedTopk
+from vllm.model_executor.layers.fused_moe.fused_moe_router import FusedMoERouter
 from vllm.model_executor.layers.fused_moe.layer import (FusedMoE, UnquantizedFusedMoEMethod)
 from vllm_gaudi.extension.ops import (VllmMixtureOfExpertsOp)
 from vllm_gaudi.extension.runtime import get_config
@@ -118,6 +119,7 @@ class HPUUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
     def forward_oot(
         self,
         layer: FusedMoE,
+        router: FusedMoERouter,
         x: torch.Tensor,
         router_logits: torch.Tensor,
         **kwargs,
@@ -125,7 +127,7 @@ class HPUUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
         input_shape = x.shape
         x = x.view(-1, x.shape[-1])
         if layer.use_grouped_topk or getattr(layer, "custom_routing_function", None) is not None:
-            topk_weights, topk_ids = layer.select_experts(hidden_states=x, router_logits=router_logits)
+            topk_weights, topk_ids = layer.router.select_experts(hidden_states=x, router_logits=router_logits)
         else:
             import torch.nn.functional as F
             topk_weights = F.softmax(router_logits, dim=1, dtype=torch.float32)
@@ -138,14 +140,15 @@ class HPUUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
             topk_weights = topk_weights.to(x.dtype)
 
         if layer.dp_size > 1:
+            dp_metadata = get_hpu_dp_metadata()
             if not (has_quant_config(layer.vllm_config.model_config) and self.use_dispatch_fn):
-                hidden_states_across_dp = get_hpu_dp_metadata().hidden_states_across_dp
+                hidden_states_across_dp = dp_metadata.hidden_states_across_dp if dp_metadata is not None else None
                 x = dispatch_tensor(x, hidden_states_across_dp, layer.is_sequence_parallel)
 
-            topk_ids_across_dp = get_hpu_dp_metadata().topk_ids_across_dp
+            topk_ids_across_dp = dp_metadata.topk_ids_across_dp if dp_metadata is not None else None
             topk_ids = dispatch_tensor(topk_ids, topk_ids_across_dp, layer.is_sequence_parallel)
 
-            topk_weights_across_dp = get_hpu_dp_metadata().topk_weights_across_dp
+            topk_weights_across_dp = dp_metadata.topk_weights_across_dp if dp_metadata is not None else None
             topk_weights = dispatch_tensor(topk_weights, topk_weights_across_dp, layer.is_sequence_parallel)
 
         topk_ids = topk_ids.view(-1, topk_ids.shape[-1])
@@ -158,7 +161,10 @@ class HPUUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
             permuted_weights=True,
             activation=layer.activation,
         )
-        return output.view(*(output.size(0), *input_shape[1:]))
+        if layer.dp_size > 1:
+            return output.view(*(output.size(0), *input_shape[1:]))
+        else:
+            return output.view(*input_shape)
 
 
 def reduce_output(self, states: torch.Tensor) -> torch.Tensor:
